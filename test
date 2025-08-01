@@ -1,0 +1,762 @@
+import SwiftUI
+import ZIPFoundation // 引入我们之前添加的库
+
+// MARK: - 1. 数据模型
+struct Item: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var name: String
+    var imageFileName: String
+    var cabinetNumber: String
+}
+
+struct Room: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var name: String
+    var cabinetNumbers: [String]
+    var layoutPathsCGPoints: [[CGPoint]]?
+    var cabinetPositions: [String: CGPoint]?
+}
+
+// 用于打包备份的核心数据结构
+struct BackupData: Codable {
+    let rooms: [Room]
+    let itemsByCabinet: [String: [Item]]
+}
+
+// MARK: - 2. 数据管理器
+class StorageManager: ObservableObject {
+    @Published var rooms: [Room] = []
+    @Published var itemsByCabinet: [String: [Item]] = [:]
+    
+    private let roomsKey = "HomeStorageAppRooms"
+    private let itemsKey = "HomeStorageAppItems"
+
+    init() {
+        loadData()
+    }
+    
+    var sortedRooms: [Room] {
+        rooms.sorted { $0.name < $1.name }
+    }
+    
+    // MARK: - Backup & Restore
+    func prepareBackupData() -> BackupData {
+        return BackupData(rooms: self.rooms, itemsByCabinet: self.itemsByCabinet)
+    }
+
+    func restoreFromBackup(data: BackupData, imageFiles: [URL]) {
+        self.rooms = []
+        self.itemsByCabinet = [:]
+        clearAllImages()
+
+        for imageURL in imageFiles {
+            do {
+                let destURL = getDocumentsDirectory().appendingPathComponent(imageURL.lastPathComponent)
+                try FileManager.default.copyItem(at: imageURL, to: destURL)
+            } catch {
+                print("Error copying restored image: \(error)")
+            }
+        }
+        
+        self.rooms = data.rooms
+        self.itemsByCabinet = data.itemsByCabinet
+        saveData()
+    }
+    
+    func getAllImageFileNames() -> Set<String> {
+        return Set(itemsByCabinet.values.flatMap { $0 }.map { $0.imageFileName })
+    }
+    
+    private func clearAllImages() {
+        let fileManager = FileManager.default
+        let documentsURL = getDocumentsDirectory()
+        do {
+            let fileURLs = try fileManager.contentsOfDirectory(at: documentsURL, includingPropertiesForKeys: nil)
+            for fileURL in fileURLs where fileURL.pathExtension.lowercased() == "jpg" {
+                try fileManager.removeItem(at: fileURL)
+            }
+        } catch {
+            print("Error clearing images: \(error)")
+        }
+    }
+    
+    // MARK: - Core Functions
+    private func getDocumentsDirectory() -> URL {
+        return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
+    
+    func saveImage(image: UIImage) -> String? {
+        guard let data = image.jpegData(compressionQuality: 0.8) else { return nil }
+        let fileName = UUID().uuidString + ".jpg"
+        let fileURL = getDocumentsDirectory().appendingPathComponent(fileName)
+        do {
+            try data.write(to: fileURL, options: [.atomicWrite, .completeFileProtection])
+            return fileName
+        } catch {
+            print("Error saving image: \(error)")
+            return nil
+        }
+    }
+    
+    func loadImage(fileName: String) -> UIImage? {
+        let fileURL = getDocumentsDirectory().appendingPathComponent(fileName)
+        return UIImage(contentsOfFile: fileURL.path)
+    }
+    
+    private func deleteImage(fileName: String) {
+        let fileURL = getDocumentsDirectory().appendingPathComponent(fileName)
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            do {
+                try FileManager.default.removeItem(at: fileURL)
+            } catch {
+                print("Error deleting image: \(error)")
+            }
+        }
+    }
+    
+    func cabinetExists(_ number: String) -> Bool {
+        return rooms.flatMap { $0.cabinetNumbers }.contains(number)
+    }
+    
+    func addItem(_ item: Item) {
+        if itemsByCabinet[item.cabinetNumber] != nil {
+            itemsByCabinet[item.cabinetNumber]?.append(item)
+        } else {
+            itemsByCabinet[item.cabinetNumber] = [item]
+        }
+        saveData()
+    }
+    
+    func createRoom(name: String, forCabinet cabinetNumber: String, withItem item: Item) {
+        let newRoom = Room(name: name, cabinetNumbers: [cabinetNumber])
+        rooms.append(newRoom)
+        addItem(item)
+    }
+    
+    func assignCabinetToRoom(cabinetNumber: String, toRoomID: UUID, withItem item: Item) {
+        if let index = rooms.firstIndex(where: { $0.id == toRoomID }) {
+            rooms[index].cabinetNumbers.append(cabinetNumber)
+            rooms[index].cabinetNumbers = Array(Set(rooms[index].cabinetNumbers)).sorted()
+        }
+        addItem(item)
+    }
+    
+    func deleteItem(item: Item) {
+        deleteImage(fileName: item.imageFileName)
+        guard var itemsInCabinet = itemsByCabinet[item.cabinetNumber] else { return }
+        itemsInCabinet.removeAll { $0.id == item.id }
+        
+        if itemsInCabinet.isEmpty {
+            itemsByCabinet.removeValue(forKey: item.cabinetNumber)
+            for i in 0..<rooms.count {
+                rooms[i].cabinetNumbers.removeAll { $0 == item.cabinetNumber }
+            }
+            rooms.removeAll { $0.cabinetNumbers.isEmpty }
+        } else {
+            itemsByCabinet[item.cabinetNumber] = itemsInCabinet
+        }
+        saveData()
+    }
+    
+    func updateRoomLayout(for roomID: UUID, layout: [[CGPoint]], positions: [String: CGPoint]) {
+        if let index = rooms.firstIndex(where: { $0.id == roomID }) {
+            rooms[index].layoutPathsCGPoints = layout
+            rooms[index].cabinetPositions = positions
+            saveData()
+        }
+    }
+    
+    func saveData() {
+        let encoder = JSONEncoder()
+        if let encodedRooms = try? encoder.encode(rooms) {
+            UserDefaults.standard.set(encodedRooms, forKey: roomsKey)
+        }
+        if let encodedItems = try? encoder.encode(itemsByCabinet) {
+            UserDefaults.standard.set(encodedItems, forKey: itemsKey)
+        }
+    }
+    
+    private func loadData() {
+        let decoder = JSONDecoder()
+        if let roomsData = UserDefaults.standard.data(forKey: roomsKey), let decodedRooms = try? decoder.decode([Room].self, from: roomsData) {
+            self.rooms = decodedRooms
+        }
+        if let itemsData = UserDefaults.standard.data(forKey: itemsKey), let decodedItems = try? decoder.decode([String: [Item]].self, from: itemsData) {
+            self.itemsByCabinet = decodedItems
+        }
+    }
+}
+
+// MARK: - 3. 主视图
+enum ActiveSheet: Identifiable {
+    case addItem
+    case assignRoom(item: Item)
+    var id: String {
+        switch self {
+        case .addItem: return "addItem"
+        case .assignRoom(let item): return "assignRoom-\(item.id)"
+        }
+    }
+}
+
+struct ContentView: View {
+    @StateObject private var storageManager = StorageManager()
+    @State private var activeSheet: ActiveSheet?
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some View {
+        NavigationView {
+            ZStack(alignment: .bottomTrailing) {
+                if storageManager.sortedRooms.isEmpty {
+                    Text("还没有房间和物品\n点击右下角按钮添加一个吧！").font(.title2).foregroundColor(.gray).multilineTextAlignment(.center).padding()
+                } else {
+                    List {
+                        ForEach(storageManager.sortedRooms) { room in
+                            NavigationLink(destination: RoomDetailView(storageManager: storageManager, room: room)) {
+                                HStack {
+                                    Image(systemName: "house.fill").foregroundColor(.blue)
+                                    Text(room.name).font(.headline)
+                                    Spacer()
+                                    Text("\(room.cabinetNumbers.count) 个柜子").foregroundColor(.secondary)
+                                }.padding(.vertical, 8)
+                            }
+                        }
+                    }
+                }
+                Button(action: { activeSheet = .addItem }) {
+                    Image(systemName: "plus.circle.fill").resizable().frame(width: 60, height: 60).foregroundColor(.accentColor).shadow(radius: 10).padding()
+                }
+            }
+            .navigationTitle("我的收纳")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    NavigationLink(destination: SettingsView(storageManager: storageManager)) {
+                        Image(systemName: "gearshape.fill")
+                    }
+                }
+            }
+            .sheet(item: $activeSheet) { sheetType in
+                switch sheetType {
+                case .addItem:
+                    AddItemView(storageManager: storageManager) { item in
+                        if let item = item { activeSheet = .assignRoom(item: item) } else { activeSheet = nil }
+                    }
+                case .assignRoom(let item):
+                    RoomAssignmentView(storageManager: storageManager, item: item) { activeSheet = nil }
+                }
+            }
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .background || newPhase == .inactive {
+                storageManager.saveData()
+            }
+        }
+    }
+}
+
+// MARK: - 4. 设置页面
+struct SettingsView: View {
+    @ObservedObject var storageManager: StorageManager
+    @State private var isShowingBackupSheet = false
+    @State private var isShowingRestorePicker = false
+    @State private var backupURL: URL?
+    @State private var alertMessage: String?
+    @State private var isShowingAlert = false
+    
+    private var backupDateFormatter: DateFormatter {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd-HHmm"
+        return formatter
+    }
+    
+    var body: some View {
+        Form {
+            Section(header: Text("数据管理")) {
+                Button(action: createBackup) {
+                    Label("备份数据", systemImage: "arrow.up.doc.fill")
+                }
+                Button(action: { isShowingRestorePicker = true }) {
+                    Label("从备份恢复", systemImage: "arrow.down.doc.fill")
+                }
+            }
+        }
+        .navigationTitle("设置")
+        .sheet(isPresented: $isShowingBackupSheet) {
+            if let url = backupURL {
+                ShareSheet(activityItems: [url])
+            }
+        }
+        .fileImporter(isPresented: $isShowingRestorePicker, allowedContentTypes: [.zip]) { result in
+            switch result {
+            case .success(let url):
+                restoreFromBackup(url: url)
+            case .failure(let error):
+                print("Error picking file: \(error.localizedDescription)")
+            }
+        }
+        .alert("提示", isPresented: $isShowingAlert) {
+            Button("好") {}
+        } message: {
+            Text(alertMessage ?? "")
+        }
+    }
+    
+    func createBackup() {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let imagesDir = tempDir.appendingPathComponent("images")
+        do {
+            try FileManager.default.createDirectory(at: imagesDir, withIntermediateDirectories: true)
+            let backupData = storageManager.prepareBackupData()
+            let metadataURL = tempDir.appendingPathComponent("metadata.json")
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted
+            let data = try encoder.encode(backupData)
+            try data.write(to: metadataURL)
+            let imageFileNames = storageManager.getAllImageFileNames()
+            let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            for fileName in imageFileNames {
+                let sourceURL = documentsDir.appendingPathComponent(fileName)
+                let destURL = imagesDir.appendingPathComponent(fileName)
+                if FileManager.default.fileExists(atPath: sourceURL.path) {
+                    try FileManager.default.copyItem(at: sourceURL, to: destURL)
+                }
+            }
+            let dateString = backupDateFormatter.string(from: Date())
+            let zipURL = FileManager.default.temporaryDirectory.appendingPathComponent("我的收纳备份-\(dateString).zip")
+            if FileManager.default.fileExists(atPath: zipURL.path) {
+                try FileManager.default.removeItem(at: zipURL)
+            }
+            try FileManager.default.zipItem(at: tempDir, to: zipURL)
+            self.backupURL = zipURL
+            self.isShowingBackupSheet = true
+        } catch {
+            alertMessage = "备份失败: \(error.localizedDescription)"
+            isShowingAlert = true
+        }
+    }
+    
+    func restoreFromBackup(url: URL) {
+        let tempUnzipDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let localZipURL = FileManager.default.temporaryDirectory.appendingPathComponent(url.lastPathComponent)
+        do {
+            guard url.startAccessingSecurityScopedResource() else {
+                throw NSError(domain: "AppError", code: 1, userInfo: [NSLocalizedDescriptionKey: "无法访问文件"])
+            }
+            if FileManager.default.fileExists(atPath: localZipURL.path) {
+                try FileManager.default.removeItem(at: localZipURL)
+            }
+            try FileManager.default.copyItem(at: url, to: localZipURL)
+            url.stopAccessingSecurityScopedResource()
+            try FileManager.default.createDirectory(at: tempUnzipDir, withIntermediateDirectories: true)
+            try FileManager.default.unzipItem(at: localZipURL, to: tempUnzipDir)
+            guard let contentDirURL = try FileManager.default.contentsOfDirectory(at: tempUnzipDir, includingPropertiesForKeys: nil, options: .skipsHiddenFiles).first else {
+                throw NSError(domain: "AppError", code: 2, userInfo: [NSLocalizedDescriptionKey: "备份文件格式不正确"])
+            }
+            let metadataURL = contentDirURL.appendingPathComponent("metadata.json")
+            let metadata = try Data(contentsOf: metadataURL)
+            let backupData = try JSONDecoder().decode(BackupData.self, from: metadata)
+            let imagesDir = contentDirURL.appendingPathComponent("images")
+            let imageFiles = try FileManager.default.contentsOfDirectory(at: imagesDir, includingPropertiesForKeys: nil)
+            storageManager.restoreFromBackup(data: backupData, imageFiles: imageFiles)
+            alertMessage = "数据已成功恢复！"
+            isShowingAlert = true
+        } catch {
+            alertMessage = "恢复失败: \(error.localizedDescription)"
+            isShowingAlert = true
+        }
+        try? FileManager.default.removeItem(at: tempUnzipDir)
+        try? FileManager.default.removeItem(at: localZipURL)
+    }
+}
+
+// MARK: - 5. 其他视图
+struct RoomDetailView: View {
+    @ObservedObject var storageManager: StorageManager
+    @State var room: Room
+
+    var body: some View {
+        List(room.cabinetNumbers.sorted(), id: \.self) { cabinetNumber in
+            NavigationLink(destination: CabinetDetailView(storageManager: storageManager, cabinetNumber: cabinetNumber)) {
+                HStack {
+                    Image(systemName: "archivebox.fill").foregroundColor(.brown)
+                    Text("柜子编号: \(cabinetNumber)")
+                    Spacer()
+                    Text("\(storageManager.itemsByCabinet[cabinetNumber]?.count ?? 0) 件").foregroundColor(.secondary)
+                }.padding(.vertical, 4)
+            }
+        }
+        .navigationTitle(room.name)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                if room.cabinetNumbers.count >= 2 {
+                    let roomBinding = Binding<Room>(
+                        get: { self.room },
+                        set: { self.room = $0 }
+                    )
+                    NavigationLink(destination: RoomLayoutView(storageManager: storageManager, room: roomBinding)) {
+                        Image(systemName: "map.fill")
+                        Text("房间布局")
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct CabinetItemView: View {
+    @ObservedObject var storageManager: StorageManager
+    let item: Item
+    
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            if let uiImage = storageManager.loadImage(fileName: item.imageFileName) {
+                Image(uiImage: uiImage).resizable().aspectRatio(contentMode: .fill).frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity).aspectRatio(1, contentMode: .fit).clipped().cornerRadius(8)
+            } else {
+                let greyRectangle = Rectangle().fill(Color.gray.opacity(0.3)).aspectRatio(1, contentMode: .fit).cornerRadius(8)
+                let photoIcon = Image(systemName: "photo.fill").foregroundColor(.white).font(.largeTitle)
+                greyRectangle.overlay(photoIcon)
+            }
+            Text(item.name).font(.caption).bold().foregroundColor(.white).padding(4).frame(maxWidth: .infinity).background(Color.black.opacity(0.5)).cornerRadius(8, c: [.bottomLeft, .bottomRight])
+        }
+        .shadow(radius: 3)
+    }
+}
+
+struct CabinetDetailView: View {
+    @ObservedObject var storageManager: StorageManager
+    let cabinetNumber: String
+    @State private var itemToConfirmDelete: Item?
+    private let columns: [GridItem] = Array(repeating: .init(.flexible()), count: 3)
+    
+    var body: some View {
+        ScrollView {
+            LazyVGrid(columns: columns, spacing: 15) {
+                ForEach(storageManager.itemsByCabinet[cabinetNumber] ?? []) { item in
+                    CabinetItemView(storageManager: storageManager, item: item)
+                        .onLongPressGesture { itemToConfirmDelete = item }
+                }
+            }.padding()
+        }
+        .navigationTitle("柜子 \(cabinetNumber)")
+        .alert(item: $itemToConfirmDelete) { item in
+            Alert(title: Text("确认删除"), message: Text("您确定要删除物品 “\(item.name)” 吗？"), primaryButton: .destructive(Text("删除")) { storageManager.deleteItem(item: item) }, secondaryButton: .cancel(Text("取消")))
+        }
+    }
+}
+
+struct AddItemView: View {
+    @ObservedObject var storageManager: StorageManager
+    var onComplete: (Item?) -> Void
+    
+    @State private var itemName: String = ""
+    @State private var cabinetNumber: String = ""
+    @State private var selectedImage: UIImage?
+    @State private var isImagePickerShowing = false
+    @State private var sourceType: UIImagePickerController.SourceType = .photoLibrary
+    @State private var isShowingSourcePicker = false
+    
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("物品信息")) {
+                    TextField("输入物品名称 (例如: 充电宝)", text: $itemName)
+                    TextField("输入柜子编号", text: $cabinetNumber).keyboardType(.numberPad)
+                }
+                Section(header: Text("物品照片")) {
+                    if let image = selectedImage {
+                        Image(uiImage: image).resizable().scaledToFit().cornerRadius(10).padding(.vertical)
+                    }
+                    Button(action: { self.isShowingSourcePicker = true }) {
+                        HStack {
+                            Image(systemName: "camera.fill")
+                            Text(selectedImage == nil ? "拍照或选择照片" : "重新选择")
+                        }
+                    }
+                }
+            }
+            .navigationTitle("添加新物品")
+            .navigationBarItems(
+                leading: Button("取消") { onComplete(nil) },
+                trailing: Button("保存", action: saveItem).disabled(selectedImage == nil || cabinetNumber.isEmpty || itemName.isEmpty)
+            )
+            .sheet(isPresented: $isImagePickerShowing) {
+                ImagePicker(selectedImage: $selectedImage, sourceType: self.sourceType)
+            }
+            .confirmationDialog("选择照片来源", isPresented: $isShowingSourcePicker, titleVisibility: .visible) {
+                if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                    Button("拍照") {
+                        self.sourceType = .camera
+                        self.isImagePickerShowing = true
+                    }
+                }
+                Button("从相册选择") {
+                    self.sourceType = .photoLibrary
+                    self.isImagePickerShowing = true
+                }
+            }
+        }
+    }
+    
+    private func saveItem() {
+        guard let image = selectedImage, !cabinetNumber.isEmpty, !itemName.isEmpty else { return }
+        guard let fileName = storageManager.saveImage(image: image) else { return }
+        let item = Item(name: itemName, imageFileName: fileName, cabinetNumber: cabinetNumber)
+        if storageManager.cabinetExists(cabinetNumber) {
+            storageManager.addItem(item)
+            onComplete(nil)
+        } else {
+            onComplete(item)
+        }
+    }
+}
+
+struct RoomAssignmentView: View {
+    @ObservedObject var storageManager: StorageManager
+    let item: Item
+    var onComplete: () -> Void
+    
+    @State private var isCreatingNewRoom = false
+    @State private var newRoomName = ""
+    
+    var body: some View {
+        NavigationView {
+            VStack {
+                if isCreatingNewRoom {
+                    Form {
+                        Section(header: Text("为柜子 \(item.cabinetNumber) 创建新房间")) {
+                            TextField("输入新房间名称", text: $newRoomName)
+                        }
+                    }
+                    Button("保存房间") {
+                        if !newRoomName.isEmpty {
+                            storageManager.createRoom(name: newRoomName, forCabinet: item.cabinetNumber, withItem: item)
+                            onComplete()
+                        }
+                    }.padding().disabled(newRoomName.isEmpty)
+                } else {
+                    List {
+                        Section(header: Text("将柜子 \(item.cabinetNumber) 归入哪个房间?")) {
+                            Button(action: { isCreatingNewRoom = true }) {
+                                HStack {
+                                    Image(systemName: "plus.circle.fill")
+                                    Text("创建新房间")
+                                }
+                            }
+                            ForEach(storageManager.sortedRooms) { room in
+                                Button(room.name) {
+                                    storageManager.assignCabinetToRoom(cabinetNumber: item.cabinetNumber, toRoomID: room.id, withItem: item)
+                                    onComplete()
+                                }
+                            }
+                        }
+                    }
+                }
+            }.navigationTitle("分配房间").navigationBarItems(leading: Button("取消") { onComplete() })
+        }
+    }
+}
+
+struct ImagePicker: UIViewControllerRepresentable {
+    @Binding var selectedImage: UIImage?
+    @Environment(\.presentationMode) var presentationMode
+    var sourceType: UIImagePickerController.SourceType
+    
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.delegate = context.coordinator
+        picker.sourceType = sourceType
+        return picker
+    }
+    
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+    
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+    
+    class Coordinator: NSObject, UINavigationControllerDelegate, UIImagePickerControllerDelegate {
+        let parent: ImagePicker
+        
+        init(_ parent: ImagePicker) {
+            self.parent = parent
+        }
+        
+        func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey : Any]) {
+            if let uiImage = info[.originalImage] as? UIImage {
+                parent.selectedImage = uiImage
+            }
+            parent.presentationMode.wrappedValue.dismiss()
+        }
+        
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            parent.presentationMode.wrappedValue.dismiss()
+        }
+    }
+}
+
+struct RoomLayoutView: View {
+    @ObservedObject var storageManager: StorageManager
+    @Binding var room: Room
+    @Environment(\.presentationMode) var presentationMode
+    
+    @State private var paths: [[CGPoint]] = []
+    @State private var currentDrawingPath: [CGPoint] = []
+    @State private var isDrawingMode = true
+    @State private var previewingCabinetNumber: String?
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            Text(isDrawingMode ? "请用手指绘制房间布局" : "请拖动柜子到指定位置").font(.headline).padding().frame(maxWidth: .infinity).background(Color.blue.opacity(0.1))
+            GeometryReader { geometry in
+                ZStack {
+                    Canvas { context, size in
+                        for pathPoints in paths {
+                            var path = Path()
+                            path.addLines(pathPoints)
+                            context.stroke(path, with: .color(.black), lineWidth: 4)
+                        }
+                        var currentPath = Path()
+                        currentPath.addLines(currentDrawingPath)
+                        context.stroke(currentPath, with: .color(.red), lineWidth: 4)
+                    }.gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { value in
+                                guard isDrawingMode else { return }
+                                currentDrawingPath.append(value.location)
+                            }
+                            .onEnded { value in
+                                guard isDrawingMode else { return }
+                                paths.append(currentDrawingPath)
+                                currentDrawingPath = []
+                            }
+                    )
+                    
+                    ForEach(room.cabinetNumbers, id: \.self) { cabinetNumber in
+                        CabinetIconView(number: cabinetNumber)
+                            .position(room.cabinetPositions?[cabinetNumber] ?? CGPoint(x: 100, y: 100))
+                            .gesture(
+                                DragGesture()
+                                    .onChanged { value in
+                                        guard !isDrawingMode else { return }
+                                        room.cabinetPositions?[cabinetNumber] = value.location
+                                    }
+                            )
+                            .onTapGesture(count: 2) {
+                                self.previewingCabinetNumber = cabinetNumber
+                            }
+                    }
+                }
+            }.background(Color.gray.opacity(0.15)).border(Color.gray, width: 1)
+        }
+        .navigationTitle("房间布局: \(room.name)")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                Button(action: { isDrawingMode.toggle() }) {
+                    Image(systemName: isDrawingMode ? "hand.draw.fill" : "arrow.up.and.down.and.arrow.left.and.right")
+                }
+                Button(action: {
+                    paths.removeAll()
+                    currentDrawingPath.removeAll()
+                }) {
+                    Image(systemName: "trash")
+                }
+                Button("保存") {
+                    room.layoutPathsCGPoints = paths
+                    storageManager.updateRoomLayout(for: room.id, layout: paths, positions: room.cabinetPositions ?? [:])
+                    presentationMode.wrappedValue.dismiss()
+                }
+            }
+        }
+        .sheet(item: $previewingCabinetNumber) { cabinetNum in
+            CabinetPreviewView(storageManager: storageManager, cabinetNumber: cabinetNum)
+        }
+        .onAppear {
+            self.paths = room.layoutPathsCGPoints ?? []
+        }
+    }
+}
+
+struct CabinetIconView: View {
+    let number: String
+    var body: some View {
+        Text(number)
+            .font(Font.system(.headline, design: .monospaced).bold())
+            .frame(width: 50, height: 50)
+            .background(Color.brown)
+            .foregroundColor(.white)
+            .clipShape(Circle())
+            .overlay(Circle().stroke(Color.white, lineWidth: 2))
+            .shadow(color: .black.opacity(0.5), radius: 3, x: 2, y: 2)
+    }
+}
+
+struct CabinetPreviewView: View {
+    @ObservedObject var storageManager: StorageManager
+    let cabinetNumber: String
+    @Environment(\.presentationMode) var presentationMode
+    private let columns: [GridItem] = Array(repeating: .init(.flexible()), count: 3)
+    
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                if let items = storageManager.itemsByCabinet[cabinetNumber], !items.isEmpty {
+                    LazyVGrid(columns: columns, spacing: 15) {
+                        ForEach(items) { item in
+                            if let uiImage = storageManager.loadImage(fileName: item.imageFileName) {
+                                Image(uiImage: uiImage).resizable().aspectRatio(contentMode: .fit).cornerRadius(8)
+                            } else {
+                                Rectangle().fill(Color.gray.opacity(0.3)).aspectRatio(1, contentMode: .fit).cornerRadius(8).overlay(Image(systemName: "photo.fill").foregroundColor(.white))
+                            }
+                        }
+                    }.padding()
+                } else {
+                    Text("这个柜子是空的").foregroundColor(.gray).padding(.top, 50)
+                }
+            }
+            .navigationTitle("柜子 \(cabinetNumber) 内物品")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("完成") {
+                        presentationMode.wrappedValue.dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - 6. 辅助扩展和UIKit封装
+struct ShareSheet: UIViewControllerRepresentable {
+    var activityItems: [Any]
+    
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        let controller = UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+        return controller
+    }
+    
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+extension String: Identifiable {
+    public var id: String { self }
+}
+
+extension View {
+    func cornerRadius(_ r: CGFloat, c: UIRectCorner) -> some View {
+        clipShape(RoundedCorner(radius: r, corners: c))
+    }
+}
+
+struct RoundedCorner: Shape {
+    var radius: CGFloat = .infinity
+    var corners: UIRectCorner = .allCorners
+    
+    func path(in rect: CGRect) -> Path {
+        let path = UIBezierPath(roundedRect: rect, byRoundingCorners: corners, cornerRadii: CGSize(width: radius, height: radius))
+        return Path(path.cgPath)
+    }
+}
+
+// @main struct YourApp: App { var body: some Scene { WindowGroup { ContentView() } } }
