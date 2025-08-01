@@ -36,7 +36,7 @@ struct Item: Identifiable, Codable, Equatable {
     var colorTag: ColorTag = .gray
 }
 
-struct Cabinet: Identifiable, Codable, Equatable {
+struct Cabinet: Identifiable, Codable, Equatable, Hashable {
     var id = UUID()
     var number: String
     var label: String = "标签"
@@ -63,7 +63,7 @@ struct BackupData: Codable {
     let itemsByCabinet: [String: [Item]]
 }
 
-// MARK: - 2. 数据管理器 (已更新)
+// MARK: - 2. 数据管理器 (无变动)
 class StorageManager: ObservableObject {
     @Published var rooms: [Room] = []
     @Published var itemsByCabinet: [String: [Item]] = [:]
@@ -79,13 +79,35 @@ class StorageManager: ObservableObject {
         rooms.sorted { $0.name < $1.name }
     }
     
-    // MARK: - 新增: 搜索功能
+    func moveItem(item: Item, toNewCabinetNumber newNumber: String) -> Bool {
+        guard cabinetExists(newNumber), item.cabinetNumber != newNumber else {
+            return false
+        }
+
+        guard var sourceCabinetItems = itemsByCabinet[item.cabinetNumber] else {
+            return false
+        }
+        sourceCabinetItems.removeAll { $0.id == item.id }
+
+        if sourceCabinetItems.isEmpty {
+            itemsByCabinet.removeValue(forKey: item.cabinetNumber)
+        } else {
+            itemsByCabinet[item.cabinetNumber] = sourceCabinetItems
+        }
+
+        var movedItem = item
+        movedItem.cabinetNumber = newNumber
+
+        if itemsByCabinet[newNumber] != nil {
+            itemsByCabinet[newNumber]?.append(movedItem)
+        } else {
+            itemsByCabinet[newNumber] = [movedItem]
+        }
+
+        saveData()
+        return true
+    }
     
-    /**
-     根据查询字符串模糊搜索物品。
-     - Parameter query: 用户输入的搜索关键词。
-     - Returns: 匹配的物品数组。如果查询为空，则返回空数组。
-     */
     func searchItems(query: String) -> [Item] {
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return []
@@ -94,11 +116,6 @@ class StorageManager: ObservableObject {
         return allItems.filter { $0.name.localizedCaseInsensitiveContains(query) }
     }
     
-    /**
-     查找指定物品所在的房间和柜子。
-     - Parameter item: 要查找的物品。
-     - Returns: 一个元组，包含房间名和柜子对象，如果找不到则返回 nil。
-     */
     func findLocation(for item: Item) -> (roomName: String, cabinet: Cabinet)? {
         for room in rooms {
             if let cabinet = room.cabinets.first(where: { $0.number == item.cabinetNumber }) {
@@ -108,7 +125,15 @@ class StorageManager: ObservableObject {
         return nil
     }
     
-    // MARK: - 房间和柜子管理 (无变动)
+    func findRoom(forCabinetNumber number: String) -> Room? {
+        for room in rooms {
+            if room.cabinets.contains(where: { $0.number == number }) {
+                return room
+            }
+        }
+        return nil
+    }
+    
     func addRoom(name: String) {
         guard !name.trimmingCharacters(in: .whitespaces).isEmpty,
               !rooms.contains(where: { $0.name == name }) else { return }
@@ -170,7 +195,6 @@ class StorageManager: ObservableObject {
         saveData()
     }
     
-    // MARK: - 物品管理 (无变动)
     func updateItemColor(itemID: UUID, inCabinet cabinetNumber: String, to newColor: ColorTag) {
         guard let cabinetIndex = itemsByCabinet[cabinetNumber]?.firstIndex(where: { $0.id == itemID }) else { return }
         itemsByCabinet[cabinetNumber]?[cabinetIndex].colorTag = newColor
@@ -233,7 +257,6 @@ class StorageManager: ObservableObject {
         }
     }
     
-    // MARK: - 数据存取和其它函数 (无变动)
     func saveData() {
         let encoder = JSONEncoder()
         if let encodedRooms = try? encoder.encode(rooms) {
@@ -339,7 +362,7 @@ class StorageManager: ObservableObject {
 }
 
 
-// MARK: - 3. 主视图 (已更新)
+// MARK: - 3. 主视图 (无变动)
 enum ActiveSheet: Identifiable {
     case addItem
     case assignRoom(item: Item)
@@ -360,10 +383,8 @@ struct ContentView: View {
     @State private var newRoomName = ""
     @State private var roomToConfirmDelete: Room?
     
-    // 新增: 搜索功能相关的状态
     @State private var searchText = ""
     
-    // 新增: 计算属性，获取搜索结果
     private var searchResults: [Item] {
         storageManager.searchItems(query: searchText)
     }
@@ -371,25 +392,20 @@ struct ContentView: View {
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
-                // 修改: 当搜索栏激活时不显示颜色筛选
                 if searchText.isEmpty {
                     ColorFilterView(storageManager: storageManager)
                 }
                 
                 ZStack(alignment: .bottomTrailing) {
-                    // 修改: 根据是否在搜索来显示不同列表
                     if !searchText.isEmpty {
-                        // 显示搜索结果
                         List(searchResults) { item in
                             NavigationLink(destination: CabinetDetailView(storageManager: storageManager, cabinetNumber: item.cabinetNumber)) {
                                 SearchResultRow(storageManager: storageManager, item: item)
                             }
                         }
                     } else if storageManager.sortedRooms.isEmpty && storageManager.itemsByCabinet.isEmpty {
-                        // 空状态提示
                         Text("还没有房间和物品\n点击左上角“+”添加房间\n或点击右下角按钮添加物品").font(.title2).foregroundColor(.gray).multilineTextAlignment(.center).padding()
                     } else {
-                        // 默认显示房间列表
                         List {
                             Section(header: Text("我的房间").font(.subheadline)) {
                                 ForEach(storageManager.sortedRooms) { room in
@@ -407,14 +423,12 @@ struct ContentView: View {
                         }
                     }
                     
-                    // 添加物品按钮
                     Button(action: { activeSheet = .addItem }) {
                         Image(systemName: "plus.circle.fill").resizable().frame(width: 60, height: 60).foregroundColor(.accentColor).shadow(radius: 10).padding()
                     }
                 }
             }
             .navigationTitle("我的收纳")
-            // 新增: 添加搜索栏
             .searchable(text: $searchText, prompt: "搜索物品名称...")
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
@@ -476,15 +490,13 @@ struct ContentView: View {
     }
 }
 
-// MARK: - 4. 新增与辅助视图 (有更新)
-// 新增: 搜索结果行视图
+// MARK: - 4. 新增与辅助视图 (无变动)
 struct SearchResultRow: View {
     @ObservedObject var storageManager: StorageManager
     let item: Item
     
     var body: some View {
         HStack {
-            // 物品图片
             if let uiImage = storageManager.loadImage(fileName: item.imageFileName) {
                 Image(uiImage: uiImage)
                     .resizable()
@@ -500,7 +512,6 @@ struct SearchResultRow: View {
                     .overlay(Image(systemName: "photo.fill").foregroundColor(.white))
             }
             
-            // 物品信息
             VStack(alignment: .leading) {
                 Text(item.name).font(.headline)
                 if let location = storageManager.findLocation(for: item) {
@@ -512,7 +523,6 @@ struct SearchResultRow: View {
             
             Spacer()
             
-            // 颜色标签
             Circle()
                 .fill(item.colorTag.color)
                 .frame(width: 15, height: 15)
@@ -694,7 +704,7 @@ struct SettingsView: View {
     }
 }
 
-// MARK: - 6. 其他视图 (无变动)
+// MARK: - 6. 其他视图 (已更新)
 struct RoomDetailView: View {
     @ObservedObject var storageManager: StorageManager
     let roomID: UUID
@@ -722,28 +732,22 @@ struct RoomDetailView: View {
         } else {
             List {
                 ForEach(sortedCabinets) { cabinet in
-                    HStack {
-                        Image(systemName: "archivebox.fill").foregroundColor(.brown)
-                        Text("\(cabinet.label):")
-                            .fontWeight(.bold)
-                        Text(cabinet.number)
-                        Spacer()
-                        Text("\(storageManager.itemsByCabinet[cabinet.number]?.count ?? 0) 件").foregroundColor(.secondary)
-                        
-                        Image(systemName: "chevron.right")
-                            .foregroundColor(.gray.opacity(0.5))
+                    NavigationLink(destination: CabinetDetailView(storageManager: storageManager, cabinetNumber: cabinet.number)) {
+                        HStack {
+                            Image(systemName: "archivebox.fill").foregroundColor(.brown)
+                            Text("\(cabinet.label):")
+                                .fontWeight(.bold)
+                            Text(cabinet.number)
+                            Spacer()
+                            Text("\(storageManager.itemsByCabinet[cabinet.number]?.count ?? 0) 件").foregroundColor(.secondary)
+                        }
+                        .padding(.vertical, 4)
                     }
-                    .padding(.vertical, 4)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
+                    .contentShape(Rectangle()) // 确保整行都可触发手势
+                    .onLongPressGesture {
                         self.cabinetToEdit = cabinet
                         self.editingLabelText = cabinet.label
                     }
-                    .background(
-                        NavigationLink(destination: CabinetDetailView(storageManager: storageManager, cabinetNumber: cabinet.number)) {
-                            EmptyView()
-                        }.opacity(0)
-                    )
                 }
                 .onDelete(perform: confirmDelete)
             }
@@ -855,14 +859,23 @@ struct CabinetDetailView: View {
     @ObservedObject var storageManager: StorageManager
     let cabinetNumber: String
     @State private var itemToConfirmDelete: Item?
+    @State private var isShowingAddItemSheet = false
+    
+    @State private var itemToMove: Item?
+    @State private var destinationCabinetNumber: String = ""
+    @State private var moveErrorMessage: String?
+    
     private let columns: [GridItem] = Array(repeating: .init(.flexible()), count: 3)
+    
+    private var parentRoom: Room? {
+        storageManager.findRoom(forCabinetNumber: cabinetNumber)
+    }
     
     var body: some View {
         ScrollView {
             LazyVGrid(columns: columns, spacing: 15) {
                 ForEach(storageManager.itemsByCabinet[cabinetNumber] ?? []) { item in
                     CabinetItemView(storageManager: storageManager, item: item)
-                        .onLongPressGesture { itemToConfirmDelete = item }
                         .contextMenu {
                             Text("修改颜色标签").font(.subheadline)
                             ForEach(ColorTag.allCases) { tag in
@@ -873,20 +886,92 @@ struct CabinetDetailView: View {
                                         .tint(tag.color)
                                 }
                             }
+                            Divider()
+                            Button(role: .destructive) {
+                                itemToConfirmDelete = item
+                            } label: {
+                                Label("删除物品", systemImage: "trash")
+                            }
+                            Button {
+                                itemToMove = item
+                                destinationCabinetNumber = ""
+                            } label: {
+                                Label("移动物品...", systemImage: "arrow.right.square")
+                            }
                         }
                 }
             }.padding()
         }
         .navigationTitle("柜子 \(cabinetNumber)")
+        .toolbar {
+            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                if let room = parentRoom, room.cabinets.count >= 2 {
+                    let roomBinding = Binding<Room>(
+                        get: { storageManager.rooms.first { $0.id == room.id } ?? room },
+                        set: { updatedRoom in
+                            if let index = storageManager.rooms.firstIndex(where: { $0.id == room.id }) {
+                                storageManager.rooms[index] = updatedRoom
+                            }
+                        }
+                    )
+                    NavigationLink(destination: RoomLayoutView(storageManager: storageManager, room: roomBinding)) {
+                        Image(systemName: "map.fill")
+                    }
+                }
+                
+                Button(action: { isShowingAddItemSheet = true }) {
+                    Image(systemName: "plus")
+                }
+            }
+        }
+        .sheet(isPresented: $isShowingAddItemSheet) {
+            AddItemView(storageManager: storageManager, prefilledCabinetNumber: cabinetNumber) { _ in
+                isShowingAddItemSheet = false
+            }
+        }
         .alert(item: $itemToConfirmDelete) { item in
             Alert(title: Text("确认删除"), message: Text("您确定要删除物品 “\(item.name)” 吗？"), primaryButton: .destructive(Text("删除")) { storageManager.deleteItem(item: item) }, secondaryButton: .cancel(Text("取消")))
+        }
+        .alert("移动物品", isPresented: .constant(itemToMove != nil)) {
+            TextField("输入目标柜子编号", text: $destinationCabinetNumber)
+                .keyboardType(.numberPad)
+            Button("移动") {
+                if let item = itemToMove {
+                    let success = storageManager.moveItem(item: item, toNewCabinetNumber: destinationCabinetNumber)
+                    if !success {
+                        self.moveErrorMessage = "移动失败。请检查柜子编号是否存在且与当前柜子不同。"
+                    }
+                }
+                itemToMove = nil
+            }
+            Button("取消", role: .cancel) {
+                itemToMove = nil
+            }
+        } message: {
+            Text("将 “\(itemToMove?.name ?? "")” 移动到哪个柜子？")
+        }
+        .alert("错误", isPresented: .constant(moveErrorMessage != nil)) {
+            Button("好") { moveErrorMessage = nil }
+        } message: {
+            Text(moveErrorMessage ?? "")
         }
     }
 }
 
 struct AddItemView: View {
     @ObservedObject var storageManager: StorageManager
+    let prefilledCabinetNumber: String?
     var onComplete: (Item?) -> Void
+    
+    init(storageManager: StorageManager, prefilledCabinetNumber: String? = nil, onComplete: @escaping (Item?) -> Void) {
+        self.storageManager = storageManager
+        self.prefilledCabinetNumber = prefilledCabinetNumber
+        self.onComplete = onComplete
+        
+        if let number = prefilledCabinetNumber {
+            _cabinetNumber = State(initialValue: number)
+        }
+    }
     
     @State private var itemName: String = ""
     @State private var cabinetNumber: String = ""
@@ -901,7 +986,9 @@ struct AddItemView: View {
             Form {
                 Section(header: Text("物品信息")) {
                     TextField("输入物品名称 (例如: 充电宝)", text: $itemName)
-                    TextField("输入柜子编号", text: $cabinetNumber).keyboardType(.numberPad)
+                    TextField("输入柜子编号", text: $cabinetNumber)
+                        .keyboardType(.numberPad)
+                        .disabled(prefilledCabinetNumber != nil)
                 }
                 
                 Section(header: Text("标签颜色")) {
@@ -1138,19 +1225,17 @@ struct CabinetIconView: View {
     let number: String
     
     var body: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: 2) {
             Text(label)
-                .font(.caption)
-                .fontWeight(.medium)
+                .font(.caption2)
                 .lineLimit(1)
-                .truncationMode(.tail)
+                .minimumScaleFactor(0.5)
                 .padding(.horizontal, 4)
-            
             Text(number)
-                .font(Font.system(.headline, design: .monospaced).bold())
+                .font(Font.system(.subheadline, design: .monospaced).bold())
         }
         .foregroundColor(.white)
-        .frame(width: 70, height: 70)
+        .frame(width: 60, height: 60)
         .background(Color.brown)
         .clipShape(Circle())
         .overlay(Circle().stroke(Color.white, lineWidth: 2))
@@ -1206,7 +1291,7 @@ struct ShareSheet: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
-extension String: Identifiable {
+extension String: @retroactive Identifiable {
     public var id: String { self }
 }
 
@@ -1225,4 +1310,3 @@ struct RoundedCorner: Shape {
         return Path(path.cgPath)
     }
 }
-
